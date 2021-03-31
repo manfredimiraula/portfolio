@@ -12,15 +12,23 @@ from sqlalchemy import create_engine
 import psycopg2
 
 
-def immobiliare_scraper(url):
+def immobiliare_scraper(url, table_type):
     """
-    Scraper for Immobiliare search, working as of 25 March 2021
-    It takes the page url and identifies the number of pages to scrape and creates the object of the HTML
+    Scraper for Immobiliare search, working as of 30 March 2021
+    It takes the page url and identifies the number of pages to scrape and creates the object of the HTML and the type of data, either rent or sales.  
     """
     # create a bs4 object read in html
     soup = BeautifulSoup(requests.get(url).content, 'html.parser')
-    # takes the page number at the end of the HTML
-    n_pages = int(soup.find_all('li', class_='disabled')[-1].text)
+
+    if table_type == 'rent':
+        # takes the page number at the end of the HTML
+        n_pages = int(soup.find_all('li', class_='disabled')[-1].text)
+    elif table_type == 'sales':
+        # takes the page number at the end of the HTML
+        page_lst = soup.find_all('ul', class_='pagination pagination__number')
+
+        for page in page_lst:
+            n_pages = int(page.find_all('a')[-1].text)
 
     # create variable to store page numbers to iterate over
     # create list of pages to iterate over
@@ -48,6 +56,10 @@ def immobiliare_scraper(url):
 
 
 def immobiliare_html_to_df(html_scraped):
+    """
+    This function takes the HTML text and split into different features as needed. The output is a df. 
+    It takes the html object scraped
+    """
     # initialize the structure of the dictionary
     dict_ = {
         'name': [],
@@ -88,9 +100,8 @@ def immobiliare_html_to_df(html_scraped):
             # extract the apt.price and trasnfrom to int. when not available we default ot 0
             if elem.find('li', class_="lif__item lif__pricing") is not None:
                 dict_['price'].append(
-                    int(re.sub(r"[^a-zA-Z0-9]+", ' ',
-                               elem.find('li', class_="lif__item lif__pricing").text.strip()).replace(" ", "")
-                        )
+                    re.sub(r"[^a-zA-Z0-9]+", ' ',
+                           elem.find('li', class_="lif__item lif__pricing").text.strip()).replace(" ", "")
                 )
             else:
                 if elem.find('li', class_="lif__item lif__pricing--wrapped").text.strip().replace(" ", "") == "PREZZOSURICHIESTA":
@@ -139,10 +150,20 @@ def immobiliare_html_to_df(html_scraped):
 
 def initialize_db_extract_immobiliare(html_scraped, table_name):
     """
-    This function extract the information based on a fixed HTML structure (valid as of 22Mar2021) and import it to a Postgres DB.
-    This function is called only the first time, when the DB is not present. If the DB is present, the function shouldn't be called
-    to avoid duplicate insertion.
+    This function extract the information based on a fixed HTML structure (valid as of 30Mar2021) and import it to a Postgres DB.
+    This function is called only the first time, when the DB is not present. 
     """
+
+    # extract info
+    tmp = immobiliare_html_to_df(html_scraped)
+    # we use sqlalchemy to load the data to Postgres
+    engine = create_engine('postgresql+psycopg2://{}:{}@{}:{}/postgres'
+                           .format('manfredi',  # username
+                                   'manfredi',  # password
+                                   'localhost',  # host
+                                   '5432'  # local port
+                                   ), echo=False
+                           )
 
     # create a connection with the database, we use psycopg2 to create the table
     try:
@@ -153,106 +174,49 @@ def initialize_db_extract_immobiliare(html_scraped, table_name):
 
     cur = conn.cursor()
 
-    # check wether the table "immobiliare" is already present and initialized.
-    # If not, we run the script to initialize and populate for the first time
     cur.execute(
         "select * from information_schema.tables where table_name=%s", (table_name,))
     check = bool(cur.rowcount)
 
-    if check == False:  # table doesn't exist yet
-
-        if table_name == 'immobiliare_rent':
-
-            # we initialize the table with the format we need
-            try:
-                cur.execute("""
-                    DROP TABLE IF EXISTS immobiliare_rent;
-                    CREATE TABLE IF NOT EXISTS immobiliare_rent
-                    (
-                        id text, 
-                        name text,
-                        summary text,
-                        price text,
-                        sqm text, 
-                        rooms text,
-                        baths text, 
-                        floors text,
-                        url text,
-                        created_at timestamp without time zone NOT NULL DEFAULT NOW(),
-                        updated_at timestamp without time zone DEFAULT NULL,
-                        --CONSTRAINT immobiliare_rent_key PRIMARY KEY (id)
-                    )
-                    WITH (
+    if check == False:
+        try:
+            cur.execute(
+                """
+                DROP TABLE if EXISTS {};
+                CREATE TABLE IF NOT EXISTS {} (
+                    id text, 
+                    name text,
+                    summary text,
+                    price text,
+                    sqm text, 
+                    rooms text,
+                    baths text, 
+                    floors text,
+                    url text,
+                    created_at timestamp without time zone NOT NULL DEFAULT NOW(),
+                    updated_at timestamp without time zone DEFAULT NULL
+                )
+                WITH (
                         OIDS = FALSE
-                    )
-                    TABLESPACE pg_default;
-                    ALTER TABLE immobiliare_rent
+                        )
+                        TABLESPACE pg_default;
+                        ALTER TABLE {}
                         OWNER to manfredi;
-                    CREATE INDEX immobiliare_rent_id ON immobiliare_rent(id, name, sqm, price);""")
-                print('Table inisitalized')
-            except:
-                print("Something wrong happened!")
+                        CREATE INDEX {}_id ON {}(id, name, sqm, price);
+                """.format(table_name,)
+            )
+        except:
+            print("Something wrong happened")
+        conn.commit()  # <--- makes sure the change is shown in the database
+        conn.close()
+        cur.close()
 
-            conn.commit()  # <--- makes sure the change is shown in the database
-            conn.close()
-            cur.close()
+        # we load into Postgres table created
+        tmp.to_sql(table_name, engine, if_exists='append', index=False,
+                   chunksize=1000, method='multi')
+        print('The table ' + str(table_name) + ' has been initialized with ' +
+              str(len(tmp))+' rows')
 
-        elif table_name == "immobiliare_sales":
-            # we initialize the table with the format we need
-            try:
-                cur.execute("""
-                    DROP TABLE IF EXISTS immobiliare_sales;
-                    CREATE TABLE IF NOT EXISTS immobiliare_sales
-                    (
-                        id varchar(255), 
-                        name varchar(255),
-                        summary varchar(255),
-                        price varchar(255),
-                        sqm varchar(255), 
-                        rooms varchar(255),
-                        baths varchar(255), 
-                        floors varchar(255),
-                        url varchar(255),
-                        created_at timestamp without time zone NOT NULL DEFAULT NOW(),
-                        updated_at timestamp without time zone DEFAULT NULL,
-                        --CONSTRAINT immobiliare_sales_key PRIMARY KEY (id)
-                    )
-                    WITH (
-                        OIDS = FALSE
-                    )
-                    TABLESPACE pg_default;
-                    ALTER TABLE immobiliare_sales
-                        OWNER to manfredi;
-                    CREATE INDEX immobiliare_sales_id ON immobiliare_sales(id, name, sqm, price);""")
-                print("table initialized")
-            except:
-                print("Something wrong happened!")
-
-            conn.commit()  # <--- makes sure the change is shown in the database
-            conn.close()
-            cur.close()
-
-        tmp = immobiliare_html_to_df(html_scraped)
-        # we use sqlalchemy to load the data to Postgres
-        engine = create_engine('postgresql+psycopg2://{}:{}@{}:{}/postgres'
-                               .format('manfredi',  # username
-                                       'manfredi',  # password
-                                       'localhost',  # host
-                                       '5432'  # local port
-                                       ), echo=False)
-
-        if table_name == "immobiliare_rent":
-            # we load into Postgres table created
-            tmp.to_sql('immobiliare_rent', engine, if_exists='append', index=False,
-                       chunksize=1000, method='multi')
-            print('The table immobiliare_rent has been initialized with ' +
-                  str(len(tmp))+' rows')
-        elif table_name == "immobiliare_sales":
-            # we load into Postgres table created
-            tmp.to_sql('immobiliare_sales', engine, if_exists='append', index=False,
-                       chunksize=1000, method='multi')
-            print('The table immobiliare_rent has been initialized with ' +
-                  str(len(tmp))+' rows')
     else:
         print('The database is already initialized')
 
@@ -295,4 +259,37 @@ def insert_immobiliare(html_scraped, table_name):
                    chunksize=1000, method='multi')
     # we load into Postgres table created
 
+    print('Inserted '+str(len(tmp))+' rows')
+
+
+def insert_immobiliare(html_scraped, table_name):
+    """
+    Function to insert successive scrape after the DB it has been initialized for the first time. 
+    """
+
+    tmp = immobiliare_html_to_df(html_scraped)
+
+    # we use sqlalchemy to connect to the DB
+    engine = create_engine('postgresql+psycopg2://{}:{}@{}:{}/postgres'
+                           .format('manfredi',  # username
+                                   'manfredi',  # password
+                                   'localhost',  # host
+                                   '5432'  # local port
+                                   ), echo=False)
+
+    # we pull the ids that are already in the table
+    ids = pd.read_sql('select id from public.{}'
+                      .format(str(table_name)), con=engine)
+
+    # yields the elements in `list_2` that are NOT in `list_1`
+    diff_list = list(np.setdiff1d(
+        list(tmp.id.astype(str)), list(ids['id'].astype(str))))
+
+    # select rows based on diff list items. We will import only rows that are not yet present
+    tmp = tmp[tmp['id'].isin(diff_list)]
+
+    # we pull the ids that are already in the table
+    tmp.to_sql(table_name, engine, if_exists='append', index=False,
+               chunksize=1000, method='multi')
+    # we load into Postgres table created
     print('Inserted '+str(len(tmp))+' rows')
